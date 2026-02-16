@@ -4,7 +4,6 @@ import os
 import psutil
 import pyautogui
 import random
-import schedule
 import signal
 import subprocess
 import threading
@@ -63,9 +62,12 @@ if DISPLAY_NAME is None or  len(DISPLAY_NAME) < 3:
 
 TIME_FORMAT = "%Y-%m-%d_%H-%M-%S"
 CSV_DELIMITER = ';'
+MEETING_END_BUFFER_SECONDS = 300
+SCHEDULER_POLL_INTERVAL_SECONDS = 30
 
 ONGOING_MEETING = False
 VIDEO_PANEL_HIDED = False
+STARTED_MEETINGS = set()
 
 
 class BackgroundThread:
@@ -210,6 +212,13 @@ def send_telegram_message(text):
         if not done and tries >= TELEGRAM_RETRIES:
             logging.error("Sending Telegram message failed {} times, please check your credentials!".format(tries))
             done = True
+
+
+def unregister_killpg_handler():
+    try:
+        atexit.unregister(os.killpg)
+    except Exception:
+        pass
        
 def check_connecting(zoom_pid, start_date, duration):
     # Check if connecting
@@ -417,6 +426,7 @@ def mute(description):
 def join(meet_id, meet_pw, duration, description):
     global VIDEO_PANEL_HIDED
     ffmpeg_debug = None
+    ffmpeg_log = None
 
     # HEADLESS STABILIZATION
     # Wait for environment/VNC to be fully ready before any interaction
@@ -498,7 +508,7 @@ def join(meet_id, meet_pw, duration, description):
             if DEBUG and ffmpeg_debug is not None:
                 # closing ffmpeg
                 os.killpg(os.getpgid(ffmpeg_debug.pid), signal.SIGQUIT)
-                atexit.unregister(os.killpg)
+                unregister_killpg_handler()
             return
 
         # Check if connecting
@@ -533,7 +543,7 @@ def join(meet_id, meet_pw, duration, description):
                 os.killpg(os.getpgid(zoom.pid), signal.SIGQUIT)
                 if DEBUG:
                     os.killpg(os.getpgid(ffmpeg_debug.pid), signal.SIGQUIT)
-                    atexit.unregister(os.killpg)
+                    unregister_killpg_handler()
                 return
 
             if pyautogui.locateCenterOnScreen(os.path.join(
@@ -570,7 +580,7 @@ def join(meet_id, meet_pw, duration, description):
                 os.killpg(os.getpgid(zoom.pid), signal.SIGQUIT)
                 if DEBUG:
                     os.killpg(os.getpgid(ffmpeg_debug.pid), signal.SIGQUIT)
-                    atexit.unregister(os.killpg)
+                    unregister_killpg_handler()
                 return
 
             if pyautogui.locateCenterOnScreen(os.path.join(
@@ -655,7 +665,7 @@ def join(meet_id, meet_pw, duration, description):
             os.killpg(os.getpgid(zoom.pid), signal.SIGQUIT)
             if DEBUG:
                 os.killpg(os.getpgid(ffmpeg_debug.pid), signal.SIGQUIT)
-                atexit.unregister(os.killpg)
+                unregister_killpg_handler()
             time.sleep(2)
             join(meet_id, meet_pw, duration, description)
 
@@ -812,7 +822,7 @@ def join(meet_id, meet_pw, duration, description):
 
     if DEBUG and ffmpeg_debug is not None:
         os.killpg(os.getpgid(ffmpeg_debug.pid), signal.SIGQUIT)
-        atexit.unregister(os.killpg)
+        unregister_killpg_handler()
 
     # Audio
     # Start recording
@@ -849,20 +859,21 @@ def join(meet_id, meet_pw, duration, description):
     # 1. libmp3lame (compressed audio) reduces size by ~9MB/min over pcm_s16le
     # 2. r 15 (reduced framerate) is sufficient for screen sharing and reduces video size
     # 3. crf 28 (increased compression) keeps text readable but saves space
-    command = f"ffmpeg -stats -loglevel error -f pulse -ac 2 -i 1 -f x11grab -r 15 -video_size {resolution_str} -i {disp} " \
+    command = f"ffmpeg -nostats -loglevel error -f pulse -ac 2 -i 1 -f x11grab -r 15 -video_size {resolution_str} -i {disp} " \
               "-vcodec libx264 -crf 28 -preset veryfast -pix_fmt yuv420p -acodec libmp3lame -ar 44100 -aq 2 -threads 0 -async 1 -vsync 1 " + filename
 
+    ffmpeg_log_path = os.path.join(REC_PATH, "ffmpeg.log")
+    ffmpeg_log = open(ffmpeg_log_path, "ab")
     ffmpeg = subprocess.Popen(
-        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, preexec_fn=os.setsid)
+        command, stdout=ffmpeg_log, stderr=ffmpeg_log, shell=True, preexec_fn=os.setsid)
 
     # Check if ffmpeg died immediately or has initial errors
     time.sleep(2)
     if ffmpeg.poll() is not None:
-        error_output = ffmpeg.stderr.read().decode()
-        logging.error(f"FFmpeg failed to start! Error: {error_output}")
+        logging.error(f"FFmpeg failed to start! Check log file: {ffmpeg_log_path}")
         print("\n" + "!"*40)
         print("CRITICAL ERROR: FFmpeg failed to start!")
-        print(error_output)
+        print(f"Check ffmpeg log file: {ffmpeg_log_path}")
         print("!"*40 + "\n")
     else:
         logging.info("FFmpeg started successfully.")
@@ -873,7 +884,7 @@ def join(meet_id, meet_pw, duration, description):
             logging.error("FFmpeg process disappeared before atexit registration!")
 
     start_date = datetime.now()
-    end_date = start_date + timedelta(seconds=duration + 300)  # Add 5 minutes buffer
+    end_date = start_date + timedelta(seconds=duration + MEETING_END_BUFFER_SECONDS)
 
     # Start thread to check active screensharing only for Zoom app
     if not join_by_url:
@@ -890,6 +901,13 @@ def join(meet_id, meet_pw, duration, description):
     
     meeting_running = True
     while meeting_running:
+        if ffmpeg.poll() is not None:
+            logging.error("FFmpeg exited unexpectedly with return code %s.", ffmpeg.returncode)
+            send_telegram_message("Recording for meeting '{}' stopped unexpectedly (ffmpeg exit code {}).".format(
+                description, ffmpeg.returncode))
+            ONGOING_MEETING = False
+            break
+
         time_now = datetime.now()
         time_remaining = end_date - time_now
         
@@ -922,7 +940,7 @@ def join(meet_id, meet_pw, duration, description):
             os.killpg(os.getpgid(ffmpeg_debug.pid), signal.SIGQUIT)
         except (ProcessLookupError, AttributeError):
             pass
-        atexit.unregister(os.killpg)
+        unregister_killpg_handler()
 
     try:
         os.killpg(os.getpgid(zoom.pid), signal.SIGQUIT)
@@ -934,7 +952,9 @@ def join(meet_id, meet_pw, duration, description):
             os.killpg(os.getpgid(ffmpeg.pid), signal.SIGQUIT)
     except (ProcessLookupError, AttributeError, NameError):
         pass
-    atexit.unregister(os.killpg)
+    if ffmpeg_log is not None and not ffmpeg_log.closed:
+        ffmpeg_log.close()
+    unregister_killpg_handler()
 
     if not ONGOING_MEETING:
         try:
@@ -986,74 +1006,112 @@ def exit_process_by_name(name):
                               "[" + str(process_id) + "]: " + str(ex))
 
 
-def join_ongoing_meeting():
+def parse_record_flag(value):
+    return str(value).strip().lower() in {'true', '1', 'yes', 'y'}
+
+
+def parse_meetings():
+    meetings = []
+    if not os.path.exists(CSV_PATH):
+        logging.error("CSV file missing: %s", CSV_PATH)
+        return meetings
+
     with open(CSV_PATH, mode='r') as csv_file:
         csv_reader = csv.DictReader(csv_file, delimiter=CSV_DELIMITER)
-        for row in csv_reader:
-            # Check and join ongoing meeting
-            curr_date = datetime.now()
-
-            # Date format: YYYY-MM-DD
-            try:
-                meeting_date = datetime.strptime(row["date"], '%Y-%m-%d').date()
-            except (ValueError, KeyError):
-                logging.error("Invalid date format in CSV for row: %s" % row.get('description', 'unknown'))
+        for row_number, row in enumerate(csv_reader, start=2):
+            description = (row.get("description") or f"meeting_{row_number}").strip() or f"meeting_{row_number}"
+            if not parse_record_flag(row.get("record", "false")):
                 continue
 
-            if meeting_date == curr_date.date():
-                curr_time = curr_date.time()
+            try:
+                meeting_date = datetime.strptime(row["date"], '%Y-%m-%d').date()
+                meeting_time = datetime.strptime(row["time"], '%H:%M').time()
+                duration_minutes = int(row["duration"])
+            except (TypeError, ValueError, KeyError):
+                logging.error("Invalid CSV values at line %s (%s). Skipping row.", row_number, description)
+                continue
 
-                start_time_csv = datetime.strptime(row["time"], '%H:%M')
-                start_date = curr_date.replace(
-                    hour=start_time_csv.hour, minute=start_time_csv.minute, second=0, microsecond=0)
-                start_time = start_date.time()
+            if duration_minutes <= 0:
+                logging.error("Invalid duration at line %s (%s). Duration must be > 0.", row_number, description)
+                continue
 
-                end_date = start_date + \
-                    timedelta(seconds=int(row["duration"]) * 60 + 300)  # Add 5 minutes
-                end_time = end_date.time()
+            meeting_id = (row.get("id") or "").strip()
+            if not meeting_id:
+                logging.error("Missing meeting id at line %s (%s).", row_number, description)
+                continue
 
-                recent_duration = (end_date - curr_date).total_seconds()
+            meetings.append({
+                "date": meeting_date,
+                "time": meeting_time,
+                "duration_minutes": duration_minutes,
+                "id": meeting_id,
+                "password": (row.get("password") or "").strip(),
+                "description": description,
+            })
 
-                if start_time < end_time:
-                    if curr_time >= start_time and curr_time <= end_time and str(row["record"]) == 'true':
-                            logging.info(
-                                "Join meeting that is currently running or scheduled for today..")
-                            join(meet_id=row["id"], meet_pw=row["password"],
-                                 duration=recent_duration, description=row["description"])
-                else:  # crosses midnight
-                    if (curr_time >= start_time or curr_time <= end_time) and str(row["record"]) == 'true':
-                            logging.info(
-                                "Join meeting that is currently running or scheduled for today..")
-                            join(meet_id=row["id"], meet_pw=row["password"],
-                                 duration=recent_duration, description=row["description"])
+    return meetings
 
 
-def setup_schedule():
-    with open(CSV_PATH, mode='r') as csv_file:
-        csv_reader = csv.DictReader(csv_file, delimiter=CSV_DELIMITER)
-        line_count = 0
-        for row in csv_reader:
-            if str(row["record"]) == 'true':
-                try:
-                    meeting_date = datetime.strptime(row["date"], '%Y-%m-%d').date()
-                except (ValueError, KeyError):
-                    logging.error("Invalid date format in CSV for row: %s" % row.get('description', 'unknown'))
-                    continue
-                
-                # Only schedule for today (ongoing joins handle immediate, this handles future today)
-                if meeting_date == datetime.now().date():
-                    start_time_obj = datetime.strptime(row["time"], '%H:%M')
-                    # Schedule 1 minute before
-                    run_time = (start_time_obj - timedelta(minutes=1)).strftime('%H:%M')
-                    
-                    cmd_string = f"schedule.every().day.at(\"{run_time}\").do(join, meet_id=\"{row['id']}\", " \
-                                 f"meet_pw=\"{row['password']}\", duration={int(row['duration']) * 60}, " \
-                                 f"description=\"{row['description']}\")"
+def get_meeting_bounds(meeting):
+    start_date = datetime.combine(meeting["date"], meeting["time"])
+    planned_end = start_date + timedelta(minutes=meeting["duration_minutes"])
+    buffered_end = planned_end + timedelta(seconds=MEETING_END_BUFFER_SECONDS)
+    return start_date, planned_end, buffered_end
 
-                    cmd = compile(cmd_string, "<string>", "eval")
-                    eval(cmd)
-                    line_count += 1
-        logging.info("Added %s meetings to today's schedule." % line_count)
+
+def get_meeting_key(meeting):
+    return "{}|{}|{}|{}".format(
+        meeting["date"].isoformat(),
+        meeting["time"].strftime('%H:%M'),
+        meeting["id"],
+        meeting["description"],
+    )
+
+
+def get_next_meeting_start(now, meetings):
+    next_start = None
+    for meeting in meetings:
+        start_date, _, _ = get_meeting_bounds(meeting)
+        if start_date > now and (next_start is None or start_date < next_start):
+            next_start = start_date
+    return next_start
+
+
+def find_due_meeting(now, meetings):
+    for meeting in meetings:
+        start_date, planned_end, buffered_end = get_meeting_bounds(meeting)
+        meeting_key = get_meeting_key(meeting)
+
+        if meeting_key in STARTED_MEETINGS:
+            continue
+        if now < start_date or now > buffered_end:
+            continue
+
+        remaining_duration = max(1, int((planned_end - now).total_seconds()))
+        return meeting, meeting_key, remaining_duration
+    return None
+
+
+def run_scheduler_loop():
+    while True:
+        now = datetime.now()
+        meetings = parse_meetings()
+        due_meeting = find_due_meeting(now, meetings)
+
+        if due_meeting is not None:
+            meeting, meeting_key, remaining_duration = due_meeting
+            STARTED_MEETINGS.add(meeting_key)
+            logging.info("Joining scheduled meeting: %s", meeting["description"])
+            join(meet_id=meeting["id"], meet_pw=meeting["password"],
+                 duration=remaining_duration, description=meeting["description"])
+            continue
+
+        next_start = get_next_meeting_start(now, meetings)
+        if next_start is None:
+            print("No upcoming meetings found.", end="\r", flush=True)
+        else:
+            print(f"Next meeting in {next_start - now}", end="\r", flush=True)
+        time.sleep(SCHEDULER_POLL_INTERVAL_SECONDS)
 
 
 def main():
@@ -1064,17 +1122,9 @@ def main():
         logging.error("Failed to create screenshot folder!")
         raise
 
-    setup_schedule()
-    join_ongoing_meeting()
+    logging.info("Starting date-aware scheduler (poll interval: %ss).", SCHEDULER_POLL_INTERVAL_SECONDS)
+    run_scheduler_loop()
 
 
 if __name__ == '__main__':
     main()
-
-while True:
-    schedule.run_pending()
-    time.sleep(1)
-    time_of_next_run = schedule.next_run()
-    time_now = datetime.now()
-    remaining = time_of_next_run - time_now
-    print(f"Next meeting in {remaining}", end="\r", flush=True)

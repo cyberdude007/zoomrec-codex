@@ -84,14 +84,16 @@ CSV must be formatted as in example/meetings.csv
 
 - Delimiter must be a semicolon "**;**"
 - Only meetings with flag "**record = true**" are joined and recorded
+- Meetings are started only on the exact "**date**" in each row (no daily repeat)
 - "**description**" is used for filename when recording
-- "**duration**" in minutes (+5 minutes to the end)
+- "**duration**" in minutes (+5 minutes buffer to the end)
+- Required fields for recorded meetings: **date**, **time**, **duration**, **id**, **description**, **record**
 
-weekday | time | duration | id | password | description | record
+date | time | duration | id | password | description | record
 -------- | -------- | -------- | -------- | -------- | -------- | --------
-monday | 09:55 | 60 | 111111111111 | 741699 | Important_Meeting | true
-monday | 14:00 | 90 | 222222222222 | 321523 | Unimportant_Meeting | false
-tuesday| 17:00 | 90 | https://zoom.us/j/123456789?pwd=abc || Meeting_with_URL | true
+2026-02-16 | 09:55 | 60 | 111111111111 | 741699 | Important_Meeting | true
+2026-02-16 | 14:00 | 90 | 222222222222 | 321523 | Unimportant_Meeting | false
+2026-02-17 | 17:00 | 90 | https://zoom.us/j/123456789?pwd=abc || Meeting_with_URL | true
 
 ### VNC
 
