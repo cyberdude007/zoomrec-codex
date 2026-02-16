@@ -64,6 +64,7 @@ TIME_FORMAT = "%Y-%m-%d_%H-%M-%S"
 CSV_DELIMITER = ';'
 MEETING_END_BUFFER_SECONDS = 300
 SCHEDULER_POLL_INTERVAL_SECONDS = 30
+MAX_JOIN_AUDIO_ATTEMPTS = 3
 
 ONGOING_MEETING = False
 VIDEO_PANEL_HIDED = False
@@ -111,9 +112,10 @@ class BackgroundThread:
 
 class HideViewOptionsThread:
 
-    def __init__(self, interval=10):
+    def __init__(self, description, interval=10):
         # Sleep interval between
         self.interval = interval
+        self.description = description
 
         thread = threading.Thread(target=self.run, args=())
         thread.daemon = True  # Daemonize thread
@@ -141,12 +143,12 @@ class HideViewOptionsThread:
                         logging.error("Could not exit poll results window!")
                         if DEBUG:
                             pyautogui.screenshot(os.path.join(DEBUG_PATH, time.strftime(
-                                TIME_FORMAT) + "-" + description) + "_close_poll_results_error.png")
+                                TIME_FORMAT) + "-" + self.description) + "_close_poll_results_error.png")
                 except TypeError:
                     logging.error("Could not find poll results window anymore!")
                     if DEBUG:
                         pyautogui.screenshot(os.path.join(DEBUG_PATH, time.strftime(
-                            TIME_FORMAT) + "-" + description) + "_find_poll_results_error.png")
+                            TIME_FORMAT) + "-" + self.description) + "_find_poll_results_error.png")
 
             # Check if view options available
             if pyautogui.locateOnScreen(os.path.join(IMG_PATH, 'view_options.png'), confidence=0.9) is not None:
@@ -364,35 +366,35 @@ def show_toolbars():
     pyautogui.moveTo(width - 1, y, duration=0.5)
 
 
-def join_audio(description):
-    audio_joined = False
-    try:
-        x, y = pyautogui.locateCenterOnScreen(os.path.join(
-            IMG_PATH, 'join_with_computer_audio.png'), confidence=0.9)
-        logging.info("Join with computer audio..")
-        pyautogui.click(x, y)
-        audio_joined = True
-        return True
-    except TypeError:
-        logging.error("Could not join with computer audio!")
-        if DEBUG:
-            pyautogui.screenshot(os.path.join(DEBUG_PATH, time.strftime(
-                TIME_FORMAT) + "-" + description) + "_join_with_computer_audio_error.png")
-    time.sleep(1)
-    if not audio_joined:
+def join_audio(description, max_attempts=MAX_JOIN_AUDIO_ATTEMPTS):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            x, y = pyautogui.locateCenterOnScreen(os.path.join(
+                IMG_PATH, 'join_with_computer_audio.png'), confidence=0.9)
+            logging.info("Join with computer audio..")
+            pyautogui.click(x, y)
+            return True
+        except TypeError:
+            logging.warning("Could not join with computer audio (attempt %s/%s).",
+                            attempt, max_attempts)
+
+        time.sleep(1)
         try:
             show_toolbars()
             x, y = pyautogui.locateCenterOnScreen(os.path.join(
                 IMG_PATH, 'join_audio.png'), confidence=0.9)
             pyautogui.click(x, y)
-            join_audio(description)
         except TypeError:
-            logging.error("Could not join audio!")
-            if DEBUG:
-                pyautogui.screenshot(os.path.join(DEBUG_PATH, time.strftime(
+            logging.warning("Could not find generic join audio button (attempt %s/%s).",
+                            attempt, max_attempts)
 
-                    TIME_FORMAT) + "-" + description) + "_join_audio_error.png")
-            return False
+        time.sleep(1)
+
+    logging.error("Could not join audio after %s attempts.", max_attempts)
+    if DEBUG:
+        pyautogui.screenshot(os.path.join(DEBUG_PATH, time.strftime(
+            TIME_FORMAT) + "-" + description) + "_join_audio_error.png")
+    return False
 
 
 def unmute(description):
@@ -666,8 +668,8 @@ def join(meet_id, meet_pw, duration, description):
             if DEBUG:
                 os.killpg(os.getpgid(ffmpeg_debug.pid), signal.SIGQUIT)
                 unregister_killpg_handler()
-            time.sleep(2)
-            join(meet_id, meet_pw, duration, description)
+            send_telegram_message("Failed to join audio in meeting '{}'.".format(description))
+            return
 
         # 'Say' something if path available (mounted)
         if os.path.exists(AUDIO_PATH):
@@ -888,7 +890,7 @@ def join(meet_id, meet_pw, duration, description):
 
     # Start thread to check active screensharing only for Zoom app
     if not join_by_url:
-        HideViewOptionsThread()
+        HideViewOptionsThread(description=description)
 
     # Send Telegram Notification
     send_telegram_message("Joined Meeting '{}' and started recording.".format(description))
