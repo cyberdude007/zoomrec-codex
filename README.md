@@ -180,6 +180,45 @@ docker run -d --restart unless-stopped \
   --security-opt seccomp:unconfined \
 kastldratza/zoomrec:latest
 ```
+
+#### Recording format and quality options
+
+Use these environment variables to tune quality, size, and compatibility for long sessions:
+
+- `RECORD_CONTAINER_FORMAT` (default: `mkv`)
+- `REMUX_TO_MP4` (default: `False`) remuxes final recording to MP4 with faststart
+- `DELETE_SOURCE_AFTER_REMUX` (default: `False`) removes source file after successful remux
+- `ENABLE_SEGMENTED_RECORDING` (default: `False`) writes recording in multiple parts
+- `SEGMENT_MINUTES` (default: `15`) segment duration when segmentation is enabled
+- `VIDEO_CODEC` (default: `libx264`)
+- `VIDEO_CRF` (default: `28`) lower value = higher quality + larger files
+- `VIDEO_PRESET` (default: `veryfast`) slower preset = smaller file + more CPU
+- `VIDEO_FPS` (default: `15`)
+- `AUDIO_CODEC` (default: `aac`, alternatives: `libmp3lame`, `opus`)
+- `AUDIO_BITRATE` (default: `128k`)
+
+Example for long sessions with MP4 output compatibility:
+
+```bash
+docker run -d --restart unless-stopped \
+  -e RECORD_CONTAINER_FORMAT=mkv \
+  -e REMUX_TO_MP4=True \
+  -e VIDEO_CODEC=libx264 \
+  -e VIDEO_CRF=24 \
+  -e VIDEO_PRESET=medium \
+  -e VIDEO_FPS=15 \
+  -e AUDIO_CODEC=aac \
+  -e AUDIO_BITRATE=128k \
+  -v $(pwd)/recordings:/home/zoomrec/recordings \
+  -v $(pwd)/example/audio:/home/zoomrec/audio \
+  -v $(pwd)/example/meetings.csv:/home/zoomrec/meetings.csv:ro \
+  -p 5901:5901 \
+  --security-opt seccomp:unconfined \
+kastldratza/zoomrec:latest
+```
+
+FFmpeg errors are written to `/home/zoomrec/recordings/ffmpeg.log`.
+
 ### Windows / _cmd_
 
 ```cmd

@@ -65,6 +65,17 @@ CSV_DELIMITER = ';'
 MEETING_END_BUFFER_SECONDS = 300
 SCHEDULER_POLL_INTERVAL_SECONDS = 30
 MAX_JOIN_AUDIO_ATTEMPTS = 3
+RECORD_CONTAINER_FORMAT = os.getenv('RECORD_CONTAINER_FORMAT', 'mkv').strip().lower()
+ENABLE_SEGMENTED_RECORDING = os.getenv('ENABLE_SEGMENTED_RECORDING', 'False') == 'True'
+SEGMENT_MINUTES = int(os.getenv('SEGMENT_MINUTES', '15'))
+REMUX_TO_MP4 = os.getenv('REMUX_TO_MP4', 'False') == 'True'
+DELETE_SOURCE_AFTER_REMUX = os.getenv('DELETE_SOURCE_AFTER_REMUX', 'False') == 'True'
+VIDEO_CODEC = os.getenv('VIDEO_CODEC', 'libx264').strip()
+VIDEO_CRF = int(os.getenv('VIDEO_CRF', '28'))
+VIDEO_PRESET = os.getenv('VIDEO_PRESET', 'veryfast').strip()
+VIDEO_FPS = int(os.getenv('VIDEO_FPS', '15'))
+AUDIO_CODEC = os.getenv('AUDIO_CODEC', 'aac').strip()
+AUDIO_BITRATE = os.getenv('AUDIO_BITRATE', '128k').strip()
 
 ONGOING_MEETING = False
 VIDEO_PANEL_HIDED = False
@@ -221,7 +232,91 @@ def unregister_killpg_handler():
         atexit.unregister(os.killpg)
     except Exception:
         pass
-       
+
+
+def wait_for_display_ready(display_name, retries=8, delay=2):
+    for _ in range(retries):
+        check = subprocess.run(
+            ["xdpyinfo", "-display", display_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if check.returncode == 0:
+            return True
+        time.sleep(delay)
+    return False
+
+
+def stop_process_group(process, process_name, timeout_seconds=8):
+    if process is None:
+        return
+    try:
+        if process.poll() is not None:
+            return
+    except Exception:
+        return
+
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGINT)
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            if process.poll() is not None:
+                return
+            time.sleep(0.2)
+    except Exception:
+        pass
+
+    try:
+        if process.poll() is None:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            time.sleep(1)
+    except Exception:
+        pass
+
+    try:
+        if process.poll() is None:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except Exception as ex:
+        logging.warning("Could not force stop %s: %s", process_name, ex)
+
+
+def get_audio_codec_args():
+    if AUDIO_CODEC == 'libmp3lame':
+        return ["-acodec", "libmp3lame", "-ar", "44100", "-aq", "2"]
+    if AUDIO_CODEC == 'opus':
+        return ["-acodec", "libopus", "-ar", "48000", "-b:a", AUDIO_BITRATE]
+    return ["-acodec", "aac", "-ar", "44100", "-b:a", AUDIO_BITRATE]
+
+
+def remux_to_mp4(input_path):
+    output_path = os.path.splitext(input_path)[0] + ".mp4"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_path,
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        output_path,
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode == 0:
+        logging.info("Remuxed recording to MP4: %s", output_path)
+        if DELETE_SOURCE_AFTER_REMUX:
+            try:
+                os.remove(input_path)
+                logging.info("Deleted source file after remux: %s", input_path)
+            except OSError as ex:
+                logging.warning("Failed deleting source after remux (%s): %s", input_path, ex)
+        return output_path
+
+    logging.error("MP4 remux failed for %s: %s", input_path, result.stderr.decode(errors='ignore'))
+    return None
+
+
 def check_connecting(zoom_pid, start_date, duration):
     # Check if connecting
     check_periods = 0
@@ -429,6 +524,8 @@ def join(meet_id, meet_pw, duration, description):
     global VIDEO_PANEL_HIDED
     ffmpeg_debug = None
     ffmpeg_log = None
+    ffmpeg = None
+    recording_file = None
 
     # HEADLESS STABILIZATION
     # Wait for environment/VNC to be fully ready before any interaction
@@ -823,7 +920,7 @@ def join(meet_id, meet_pw, duration, description):
             pass
 
     if DEBUG and ffmpeg_debug is not None:
-        os.killpg(os.getpgid(ffmpeg_debug.pid), signal.SIGQUIT)
+        stop_process_group(ffmpeg_debug, "ffmpeg_debug")
         unregister_killpg_handler()
 
     # Audio
@@ -831,7 +928,7 @@ def join(meet_id, meet_pw, duration, description):
     logging.info("Start recording..")
 
     filename = os.path.join(REC_PATH, time.strftime(
-        TIME_FORMAT) + "-" + description) + ".mkv"
+        TIME_FORMAT) + "-" + description) + f".{RECORD_CONTAINER_FORMAT}"
 
     # DYNAMIC RESOLUTION DETECTION (STABLE)
     try:
@@ -857,17 +954,75 @@ def join(meet_id, meet_pw, duration, description):
     print("="*40 + "\n")
     logging.info(f"Screen resolution: {resolution_str} | Capturing whole display: {disp}")
 
-    # Aggressively optimized for small file size (targeting ~1.5-2MB/min)
-    # 1. libmp3lame (compressed audio) reduces size by ~9MB/min over pcm_s16le
-    # 2. r 15 (reduced framerate) is sufficient for screen sharing and reduces video size
-    # 3. crf 28 (increased compression) keeps text readable but saves space
-    command = f"ffmpeg -nostats -loglevel error -f pulse -ac 2 -i 1 -f x11grab -r 15 -video_size {resolution_str} -i {disp} " \
-              "-vcodec libx264 -crf 28 -preset veryfast -pix_fmt yuv420p -acodec libmp3lame -ar 44100 -aq 2 -threads 0 -async 1 -vsync 1 " + filename
+    if not wait_for_display_ready(disp):
+        logging.error("Display %s is not ready for capture.", disp)
+        send_telegram_message("Display {} is not available for recording '{}'.".format(disp, description))
+        try:
+            os.killpg(os.getpgid(zoom.pid), signal.SIGQUIT)
+        except Exception:
+            pass
+        return
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-nostats",
+        "-loglevel",
+        "error",
+        "-f",
+        "pulse",
+        "-ac",
+        "2",
+        "-thread_queue_size",
+        "512",
+        "-i",
+        "1",
+        "-f",
+        "x11grab",
+        "-framerate",
+        str(VIDEO_FPS),
+        "-video_size",
+        resolution_str,
+        "-use_wallclock_as_timestamps",
+        "1",
+        "-i",
+        disp,
+        "-vcodec",
+        VIDEO_CODEC,
+        "-crf",
+        str(VIDEO_CRF),
+        "-preset",
+        VIDEO_PRESET,
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    ffmpeg_cmd.extend(get_audio_codec_args())
+    ffmpeg_cmd.extend(["-threads", "0", "-async", "1"])
+
+    if ENABLE_SEGMENTED_RECORDING:
+        segment_seconds = max(60, SEGMENT_MINUTES * 60)
+        output_pattern = os.path.join(
+            REC_PATH,
+            f"{time.strftime(TIME_FORMAT)}-{description}-part-%Y%m%d_%H%M%S.{RECORD_CONTAINER_FORMAT}"
+        )
+        ffmpeg_cmd.extend([
+            "-f",
+            "segment",
+            "-segment_time",
+            str(segment_seconds),
+            "-reset_timestamps",
+            "1",
+            "-strftime",
+            "1",
+            output_pattern,
+        ])
+    else:
+        recording_file = filename
+        ffmpeg_cmd.append(recording_file)
 
     ffmpeg_log_path = os.path.join(REC_PATH, "ffmpeg.log")
     ffmpeg_log = open(ffmpeg_log_path, "ab")
     ffmpeg = subprocess.Popen(
-        command, stdout=ffmpeg_log, stderr=ffmpeg_log, shell=True, preexec_fn=os.setsid)
+        ffmpeg_cmd, stdout=ffmpeg_log, stderr=ffmpeg_log, preexec_fn=os.setsid)
 
     # Check if ffmpeg died immediately or has initial errors
     time.sleep(2)
@@ -951,12 +1106,15 @@ def join(meet_id, meet_pw, duration, description):
 
     try:
         if ffmpeg.poll() is None:
-            os.killpg(os.getpgid(ffmpeg.pid), signal.SIGQUIT)
+            stop_process_group(ffmpeg, "ffmpeg_main")
     except (ProcessLookupError, AttributeError, NameError):
         pass
     if ffmpeg_log is not None and not ffmpeg_log.closed:
         ffmpeg_log.close()
     unregister_killpg_handler()
+
+    if REMUX_TO_MP4 and not ENABLE_SEGMENTED_RECORDING and recording_file is not None and os.path.exists(recording_file):
+        remux_to_mp4(recording_file)
 
     if not ONGOING_MEETING:
         try:
