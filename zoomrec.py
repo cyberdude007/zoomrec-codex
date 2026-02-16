@@ -21,11 +21,47 @@ global TELEGRAM_CHAT_ID
 logging.basicConfig(
     format='%(asctime)s %(levelname)s %(message)s', level=logging.INFO)
 
+
+def get_env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def get_env_int(name, default, min_value=None, max_value=None):
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+
+    try:
+        value = int(raw_value.strip())
+    except ValueError:
+        logging.warning("Invalid integer for %s=%r. Falling back to %s.", name, raw_value, default)
+        return default
+
+    if min_value is not None and value < min_value:
+        logging.warning("%s=%s below min %s. Falling back to %s.", name, value, min_value, default)
+        return default
+    if max_value is not None and value > max_value:
+        logging.warning("%s=%s above max %s. Falling back to %s.", name, value, max_value, default)
+        return default
+    return value
+
+
+def get_env_choice(name, default, allowed_values):
+    value = os.getenv(name, default).strip().lower()
+    if value in allowed_values:
+        return value
+    logging.warning("Invalid value for %s=%r. Allowed: %s. Falling back to %s.",
+                    name, value, ",".join(sorted(allowed_values)), default)
+    return default
+
 # Turn DEBUG on:
 #   - screenshot on error
 #   - record joining
 #   - do not exit container on error
-DEBUG = True if os.getenv('DEBUG') == 'True' else False
+DEBUG = get_env_bool('DEBUG', False)
 
 # Disable failsafe
 pyautogui.FAILSAFE = False
@@ -65,17 +101,21 @@ CSV_DELIMITER = ';'
 MEETING_END_BUFFER_SECONDS = 300
 SCHEDULER_POLL_INTERVAL_SECONDS = 30
 MAX_JOIN_AUDIO_ATTEMPTS = 3
-RECORD_CONTAINER_FORMAT = os.getenv('RECORD_CONTAINER_FORMAT', 'mkv').strip().lower()
-ENABLE_SEGMENTED_RECORDING = os.getenv('ENABLE_SEGMENTED_RECORDING', 'False') == 'True'
-SEGMENT_MINUTES = int(os.getenv('SEGMENT_MINUTES', '15'))
-REMUX_TO_MP4 = os.getenv('REMUX_TO_MP4', 'False') == 'True'
-DELETE_SOURCE_AFTER_REMUX = os.getenv('DELETE_SOURCE_AFTER_REMUX', 'False') == 'True'
-VIDEO_CODEC = os.getenv('VIDEO_CODEC', 'libx264').strip()
-VIDEO_CRF = int(os.getenv('VIDEO_CRF', '28'))
+RECORD_CONTAINER_FORMAT = get_env_choice('RECORD_CONTAINER_FORMAT', 'mkv', {'mkv', 'mp4'})
+ENABLE_SEGMENTED_RECORDING = get_env_bool('ENABLE_SEGMENTED_RECORDING', False)
+SEGMENT_MINUTES = get_env_int('SEGMENT_MINUTES', 15, min_value=1, max_value=240)
+REMUX_TO_MP4 = get_env_bool('REMUX_TO_MP4', False)
+DELETE_SOURCE_AFTER_REMUX = get_env_bool('DELETE_SOURCE_AFTER_REMUX', False)
+VIDEO_CODEC = os.getenv('VIDEO_CODEC', 'libx264').strip() or 'libx264'
+VIDEO_CRF = get_env_int('VIDEO_CRF', 28, min_value=0, max_value=51)
 VIDEO_PRESET = os.getenv('VIDEO_PRESET', 'veryfast').strip()
-VIDEO_FPS = int(os.getenv('VIDEO_FPS', '15'))
-AUDIO_CODEC = os.getenv('AUDIO_CODEC', 'aac').strip()
+if not VIDEO_PRESET:
+    VIDEO_PRESET = 'veryfast'
+VIDEO_FPS = get_env_int('VIDEO_FPS', 15, min_value=1, max_value=60)
+AUDIO_CODEC = get_env_choice('AUDIO_CODEC', 'aac', {'aac', 'libmp3lame', 'opus'})
 AUDIO_BITRATE = os.getenv('AUDIO_BITRATE', '128k').strip()
+if not AUDIO_BITRATE:
+    AUDIO_BITRATE = '128k'
 
 ONGOING_MEETING = False
 VIDEO_PANEL_HIDED = False
