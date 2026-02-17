@@ -31,6 +31,11 @@ echo -e "\nConnect to $VNC_IP:$VNC_PORT"
 # Start xfce4
 "$START_DIR"/xfce.sh &> "$START_DIR"/xfce.log
 
+# Ensure local clients like ffmpeg can keep accessing DISPLAY even after VNC client connects.
+export XAUTHORITY="$HOME/.Xauthority"
+xhost +SI:localuser:zoomrec > /dev/null 2>&1 || true
+xhost +local: > /dev/null 2>&1 || true
+
 # Cleanup to ensure pulseaudio is stateless
 rm -rf /var/run/pulse /var/lib/pulse /home/zoomrec/.config/pulse
 

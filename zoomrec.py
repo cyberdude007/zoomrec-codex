@@ -123,6 +123,8 @@ ONGOING_MEETING = False
 VIDEO_PANEL_HIDED = False
 STARTED_MEETINGS = set()
 RELOAD_REQUESTED = False
+CSV_LAST_MTIME = None
+LAST_MEETING_COUNT = None
 
 
 class BackgroundThread:
@@ -289,6 +291,26 @@ def wait_for_display_ready(display_name, retries=8, delay=2):
             return True
         time.sleep(delay)
     return False
+
+
+def ensure_x_access(display_name):
+    env = os.environ.copy()
+    env["DISPLAY"] = display_name
+    current_user = os.getenv("USER", "zoomrec")
+    subprocess.run(
+        ["xhost", f"+SI:localuser:{current_user}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        check=False,
+    )
+    subprocess.run(
+        ["xhost", "+local:"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        check=False,
+    )
 
 
 def stop_process_group(process, process_name, timeout_seconds=8):
@@ -1020,6 +1042,7 @@ def join(meet_id, meet_pw, duration, description):
     print("="*40 + "\n")
     logging.info(f"Screen resolution: {resolution_str} | Capturing whole display: {disp}")
 
+    ensure_x_access(disp)
     if not wait_for_display_ready(disp):
         logging.error("Display %s is not ready for capture.", disp)
         send_telegram_message("Display {} is not available for recording '{}'.".format(disp, description))
@@ -1066,6 +1089,9 @@ def join(meet_id, meet_pw, duration, description):
 
     ffmpeg_log_path = os.path.join(REC_PATH, "ffmpeg.log")
     ffmpeg_log = open(ffmpeg_log_path, "ab")
+    ffmpeg_env = os.environ.copy()
+    ffmpeg_env["DISPLAY"] = disp
+    ffmpeg_env.setdefault("XAUTHORITY", os.path.join(BASE_PATH, ".Xauthority"))
     def start_recording_process(restart_idx):
         cmd = list(ffmpeg_cmd_base)
         if ENABLE_SEGMENTED_RECORDING:
@@ -1084,14 +1110,14 @@ def join(meet_id, meet_pw, duration, description):
                 output_pattern,
             ])
             process = subprocess.Popen(
-                cmd, stdout=ffmpeg_log, stderr=ffmpeg_log, preexec_fn=os.setsid)
+                cmd, stdout=ffmpeg_log, stderr=ffmpeg_log, preexec_fn=os.setsid, env=ffmpeg_env)
             return process, None, output_pattern
 
         output_file = f"{base_filename_no_ext}.{RECORD_CONTAINER_FORMAT}" if restart_idx == 0 else \
             f"{base_filename_no_ext}-cont-{restart_idx:02d}.{RECORD_CONTAINER_FORMAT}"
         cmd.append(output_file)
         process = subprocess.Popen(
-            cmd, stdout=ffmpeg_log, stderr=ffmpeg_log, preexec_fn=os.setsid)
+            cmd, stdout=ffmpeg_log, stderr=ffmpeg_log, preexec_fn=os.setsid, env=ffmpeg_env)
         return process, output_file, None
 
     ffmpeg, recording_file, segment_pattern = start_recording_process(0)
@@ -1133,8 +1159,24 @@ def join(meet_id, meet_pw, duration, description):
     logging.info("Recording started! Scheduled to end at: %s" % end_date.strftime('%H:%M:%S'))
     
     ffmpeg_restart_attempts = 0
+    last_progress_bytes = 0
+    last_progress_at = time.time()
     meeting_running = True
     while meeting_running:
+        if not ENABLE_SEGMENTED_RECORDING and recording_files:
+            try:
+                latest_file = recording_files[-1]
+                if os.path.exists(latest_file):
+                    current_bytes = os.path.getsize(latest_file)
+                    if current_bytes > last_progress_bytes:
+                        last_progress_bytes = current_bytes
+                        last_progress_at = time.time()
+                    elif time.time() - last_progress_at > 45:
+                        logging.warning("Recording output stalled for >45s. Restarting ffmpeg capture.")
+                        stop_process_group(ffmpeg, "ffmpeg_stall_restart")
+            except OSError:
+                pass
+
         if ffmpeg.poll() is not None:
             logging.error("FFmpeg exited unexpectedly with return code %s.", ffmpeg.returncode)
             ffmpeg_restart_attempts += 1
@@ -1145,6 +1187,7 @@ def join(meet_id, meet_pw, duration, description):
                 ONGOING_MEETING = False
                 break
 
+            ensure_x_access(disp)
             if not wait_for_display_ready(disp, retries=5, delay=2):
                 logging.error("Display %s unavailable while trying to restart ffmpeg.", disp)
                 time.sleep(2)
@@ -1158,6 +1201,8 @@ def join(meet_id, meet_pw, duration, description):
 
             if recording_file is not None:
                 recording_files.append(recording_file)
+                last_progress_bytes = 0
+                last_progress_at = time.time()
             if segment_pattern is not None:
                 segment_patterns.append(segment_pattern)
 
@@ -1276,12 +1321,24 @@ def parse_record_flag(value):
 
 
 def parse_meetings():
+    global CSV_LAST_MTIME
+    global LAST_MEETING_COUNT
     meetings = []
     if not os.path.exists(CSV_PATH):
         logging.error("CSV file missing: %s", CSV_PATH)
         return meetings
 
-    with open(CSV_PATH, mode='r') as csv_file:
+    try:
+        current_mtime = os.path.getmtime(CSV_PATH)
+        if CSV_LAST_MTIME is None:
+            CSV_LAST_MTIME = current_mtime
+        elif current_mtime != CSV_LAST_MTIME:
+            CSV_LAST_MTIME = current_mtime
+            logging.info("Detected meetings.csv update at %s", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    except OSError:
+        pass
+
+    with open(CSV_PATH, mode='r', encoding='utf-8-sig', newline='') as csv_file:
         csv_reader = csv.DictReader(csv_file, delimiter=CSV_DELIMITER)
         for row_number, row in enumerate(csv_reader, start=2):
             description = (row.get("description") or f"meeting_{row_number}").strip() or f"meeting_{row_number}"
@@ -1313,6 +1370,10 @@ def parse_meetings():
                 "password": (row.get("password") or "").strip(),
                 "description": description,
             })
+
+    if LAST_MEETING_COUNT != len(meetings):
+        LAST_MEETING_COUNT = len(meetings)
+        logging.info("Loaded %s recordable meeting(s) from meetings.csv.", LAST_MEETING_COUNT)
 
     return meetings
 

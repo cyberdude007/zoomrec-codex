@@ -222,6 +222,7 @@ FFmpeg errors are written to `/home/zoomrec/recordings/ffmpeg.log`.
 
 If display capture breaks temporarily (for example while interacting over VNC), zoomrec now attempts
 to restart ffmpeg automatically and continue recording in continuation files (`-cont-XX`).
+When this happens you will also see restart messages in logs and Telegram notifications.
 
 ### Reload meetings.csv without restarting container
 
@@ -237,6 +238,11 @@ docker exec <container_name> touch /home/zoomrec/.meetings.reload
 ```bash
 docker exec <container_name> pkill -HUP -f "python3 -u /home/zoomrec/zoomrec.py"
 ```
+
+Notes:
+- Use UTF-8 CSV (UTF-8 with BOM is also supported).
+- Scheduler logs now include `Detected meetings.csv update ...` and
+  `Loaded N recordable meeting(s) from meetings.csv.` to confirm reload.
 
 ### Windows / _cmd_
 
