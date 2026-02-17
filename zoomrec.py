@@ -696,7 +696,7 @@ def join(meet_id, meet_pw, duration, description):
                 # closing ffmpeg
                 os.killpg(os.getpgid(ffmpeg_debug.pid), signal.SIGQUIT)
                 unregister_killpg_handler()
-            return
+            return False
 
         # Check if connecting
         check_connecting(zoom.pid, start_date, duration)
@@ -731,7 +731,7 @@ def join(meet_id, meet_pw, duration, description):
                 if DEBUG:
                     os.killpg(os.getpgid(ffmpeg_debug.pid), signal.SIGQUIT)
                     unregister_killpg_handler()
-                return
+                return False
 
             if pyautogui.locateCenterOnScreen(os.path.join(
                     IMG_PATH, 'wait_for_host.png'), confidence=0.9) is None:
@@ -768,7 +768,7 @@ def join(meet_id, meet_pw, duration, description):
                 if DEBUG:
                     os.killpg(os.getpgid(ffmpeg_debug.pid), signal.SIGQUIT)
                     unregister_killpg_handler()
-                return
+                return False
 
             if pyautogui.locateCenterOnScreen(os.path.join(
                     IMG_PATH, 'waiting_room.png'), confidence=0.9) is None:
@@ -854,7 +854,7 @@ def join(meet_id, meet_pw, duration, description):
                 os.killpg(os.getpgid(ffmpeg_debug.pid), signal.SIGQUIT)
                 unregister_killpg_handler()
             send_telegram_message("Failed to join audio in meeting '{}'.".format(description))
-            return
+            return False
 
         # 'Say' something if path available (mounted)
         if os.path.exists(AUDIO_PATH):
@@ -915,7 +915,7 @@ def join(meet_id, meet_pw, duration, description):
                 if DEBUG:
                     pyautogui.screenshot(os.path.join(DEBUG_PATH, time.strftime(
                         TIME_FORMAT) + "-" + description) + "_enter_fullscreen_error.png")
-                return
+                return False
 
             time.sleep(2)
 
@@ -1278,6 +1278,7 @@ def join(meet_id, meet_pw, duration, description):
                     TIME_FORMAT) + "-" + description) + "_ok_error.png")
                 
     send_telegram_message("Meeting '{}' ended.".format(description))
+    return True
 
 def play_audio(description):
     # Get all files in audio directory
@@ -1346,9 +1347,9 @@ def parse_meetings():
                 continue
 
             try:
-                meeting_date = datetime.strptime(row["date"], '%Y-%m-%d').date()
-                meeting_time = datetime.strptime(row["time"], '%H:%M').time()
-                duration_minutes = int(row["duration"])
+                meeting_date = datetime.strptime((row.get("date") or "").strip(), '%Y-%m-%d').date()
+                meeting_time = datetime.strptime((row.get("time") or "").strip(), '%H:%M').time()
+                duration_minutes = int((row.get("duration") or "").strip())
             except (TypeError, ValueError, KeyError):
                 logging.error("Invalid CSV values at line %s (%s). Skipping row.", row_number, description)
                 continue
@@ -1403,6 +1404,15 @@ def get_next_meeting_start(now, meetings):
     return next_start
 
 
+def get_closest_meeting_start(now, meetings):
+    closest = None
+    for meeting in meetings:
+        start_date, _, _ = get_meeting_bounds(meeting)
+        if closest is None or abs((start_date - now).total_seconds()) < abs((closest - now).total_seconds()):
+            closest = start_date
+    return closest
+
+
 def find_due_meeting(now, meetings):
     for meeting in meetings:
         start_date, planned_end, buffered_end = get_meeting_bounds(meeting)
@@ -1429,15 +1439,29 @@ def run_scheduler_loop():
 
         if due_meeting is not None:
             meeting, meeting_key, remaining_duration = due_meeting
-            STARTED_MEETINGS.add(meeting_key)
             logging.info("Joining scheduled meeting: %s", meeting["description"])
-            join(meet_id=meeting["id"], meet_pw=meeting["password"],
-                 duration=remaining_duration, description=meeting["description"])
+            join_ok = join(meet_id=meeting["id"], meet_pw=meeting["password"],
+                           duration=remaining_duration, description=meeting["description"])
+            if join_ok:
+                STARTED_MEETINGS.add(meeting_key)
+            else:
+                logging.warning("Join failed for meeting %s. Scheduler will retry on next cycle.",
+                                meeting["description"])
             continue
 
         next_start = get_next_meeting_start(now, meetings)
         if next_start is None:
-            print("No upcoming meetings found.", end="\r", flush=True)
+            closest_start = get_closest_meeting_start(now, meetings)
+            if closest_start is None:
+                print("No upcoming meetings found.", end="\r", flush=True)
+            else:
+                relation = "past" if closest_start < now else "future"
+                print(
+                    f"No upcoming meetings. Container time: {now.strftime('%Y-%m-%d %H:%M:%S')} | "
+                    f"Closest scheduled ({relation}): {closest_start.strftime('%Y-%m-%d %H:%M:%S')}",
+                    end="\r",
+                    flush=True
+                )
         else:
             print(f"Next meeting in {next_start - now}", end="\r", flush=True)
         slept = 0
