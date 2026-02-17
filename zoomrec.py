@@ -1473,6 +1473,17 @@ def run_scheduler_loop():
             slept += 1
 
 
+def run_scheduler_supervisor():
+    while True:
+        try:
+            run_scheduler_loop()
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            logging.exception("Scheduler crashed unexpectedly. Restarting loop in 5 seconds.")
+            time.sleep(5)
+
+
 def main():
     try:
         if DEBUG and not os.path.exists(DEBUG_PATH):
@@ -1487,7 +1498,7 @@ def main():
         pass
 
     logging.info("Starting date-aware scheduler (poll interval: %ss).", SCHEDULER_POLL_INTERVAL_SECONDS)
-    run_scheduler_loop()
+    run_scheduler_supervisor()
 
 
 if __name__ == '__main__':

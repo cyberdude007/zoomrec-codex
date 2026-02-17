@@ -61,9 +61,9 @@ sleep 5
 
 # Start python script in separated terminal
 if [[ "$DEBUG" == "True" ]]; then
-  # Wait if something failed
-  xfce4-terminal -H --geometry 85x7+0 --title=zoomrec --hide-toolbar --hide-menubar --hide-scrollbar --hide-borders --zoom=-3 -e "python3 -u ${HOME}/zoomrec.py"
+  # Keep terminal open and auto-restart scheduler if it exits.
+  xfce4-terminal -H --geometry 85x7+0 --title=zoomrec --hide-toolbar --hide-menubar --hide-scrollbar --hide-borders --zoom=-3 -e "bash -lc 'while true; do python3 -u ${HOME}/zoomrec.py; rc=\$?; echo \"zoomrec exited with status \$rc at \$(date)\"; sleep 5; done'"
 else
-  # Exit container if something failed
-  xfce4-terminal --geometry 85x7+0 --title=zoomrec --hide-toolbar --hide-menubar --hide-scrollbar --hide-borders --zoom=-3 -e "python3 -u ${HOME}/zoomrec.py"
+  # Auto-restart scheduler if it exits to preserve polling behavior.
+  xfce4-terminal --geometry 85x7+0 --title=zoomrec --hide-toolbar --hide-menubar --hide-scrollbar --hide-borders --zoom=-3 -e "bash -lc 'while true; do python3 -u ${HOME}/zoomrec.py; rc=\$?; echo \"zoomrec exited with status \$rc at \$(date)\"; sleep 5; done'"
 fi
