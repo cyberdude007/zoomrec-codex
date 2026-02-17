@@ -116,10 +116,13 @@ AUDIO_CODEC = get_env_choice('AUDIO_CODEC', 'aac', {'aac', 'libmp3lame', 'opus'}
 AUDIO_BITRATE = os.getenv('AUDIO_BITRATE', '128k').strip()
 if not AUDIO_BITRATE:
     AUDIO_BITRATE = '128k'
+MAX_FFMPEG_RESTARTS = get_env_int('MAX_FFMPEG_RESTARTS', 5, min_value=0, max_value=20)
+RELOAD_TRIGGER_FILE = os.path.join(BASE_PATH, ".meetings.reload")
 
 ONGOING_MEETING = False
 VIDEO_PANEL_HIDED = False
 STARTED_MEETINGS = set()
+RELOAD_REQUESTED = False
 
 
 class BackgroundThread:
@@ -357,6 +360,28 @@ def remux_to_mp4(input_path):
     return None
 
 
+def request_reload(_signum, _frame):
+    global RELOAD_REQUESTED
+    RELOAD_REQUESTED = True
+    logging.info("Received reload signal. meetings.csv will be reloaded.")
+
+
+def should_reload_now():
+    global RELOAD_REQUESTED
+    if RELOAD_REQUESTED:
+        RELOAD_REQUESTED = False
+        return True
+
+    if os.path.exists(RELOAD_TRIGGER_FILE):
+        try:
+            os.remove(RELOAD_TRIGGER_FILE)
+        except OSError:
+            pass
+        logging.info("Reload trigger file detected. meetings.csv will be reloaded.")
+        return True
+    return False
+
+
 def check_connecting(zoom_pid, start_date, duration):
     # Check if connecting
     check_periods = 0
@@ -565,7 +590,8 @@ def join(meet_id, meet_pw, duration, description):
     ffmpeg_debug = None
     ffmpeg_log = None
     ffmpeg = None
-    recording_file = None
+    recording_files = []
+    segment_patterns = []
 
     # HEADLESS STABILIZATION
     # Wait for environment/VNC to be fully ready before any interaction
@@ -967,8 +993,8 @@ def join(meet_id, meet_pw, duration, description):
     # Start recording
     logging.info("Start recording..")
 
-    filename = os.path.join(REC_PATH, time.strftime(
-        TIME_FORMAT) + "-" + description) + f".{RECORD_CONTAINER_FORMAT}"
+    base_filename_no_ext = os.path.join(REC_PATH, time.strftime(
+        TIME_FORMAT) + "-" + description)
 
     # DYNAMIC RESOLUTION DETECTION (STABLE)
     try:
@@ -1003,7 +1029,7 @@ def join(meet_id, meet_pw, duration, description):
             pass
         return
 
-    ffmpeg_cmd = [
+    ffmpeg_cmd_base = [
         "ffmpeg",
         "-nostats",
         "-loglevel",
@@ -1035,34 +1061,44 @@ def join(meet_id, meet_pw, duration, description):
         "-pix_fmt",
         "yuv420p",
     ]
-    ffmpeg_cmd.extend(get_audio_codec_args())
-    ffmpeg_cmd.extend(["-threads", "0", "-async", "1"])
-
-    if ENABLE_SEGMENTED_RECORDING:
-        segment_seconds = max(60, SEGMENT_MINUTES * 60)
-        output_pattern = os.path.join(
-            REC_PATH,
-            f"{time.strftime(TIME_FORMAT)}-{description}-part-%Y%m%d_%H%M%S.{RECORD_CONTAINER_FORMAT}"
-        )
-        ffmpeg_cmd.extend([
-            "-f",
-            "segment",
-            "-segment_time",
-            str(segment_seconds),
-            "-reset_timestamps",
-            "1",
-            "-strftime",
-            "1",
-            output_pattern,
-        ])
-    else:
-        recording_file = filename
-        ffmpeg_cmd.append(recording_file)
+    ffmpeg_cmd_base.extend(get_audio_codec_args())
+    ffmpeg_cmd_base.extend(["-threads", "0", "-async", "1"])
 
     ffmpeg_log_path = os.path.join(REC_PATH, "ffmpeg.log")
     ffmpeg_log = open(ffmpeg_log_path, "ab")
-    ffmpeg = subprocess.Popen(
-        ffmpeg_cmd, stdout=ffmpeg_log, stderr=ffmpeg_log, preexec_fn=os.setsid)
+    def start_recording_process(restart_idx):
+        cmd = list(ffmpeg_cmd_base)
+        if ENABLE_SEGMENTED_RECORDING:
+            segment_seconds = max(60, SEGMENT_MINUTES * 60)
+            segment_prefix = f"{base_filename_no_ext}-part{restart_idx:02d}"
+            output_pattern = f"{segment_prefix}-%Y%m%d_%H%M%S.{RECORD_CONTAINER_FORMAT}"
+            cmd.extend([
+                "-f",
+                "segment",
+                "-segment_time",
+                str(segment_seconds),
+                "-reset_timestamps",
+                "1",
+                "-strftime",
+                "1",
+                output_pattern,
+            ])
+            process = subprocess.Popen(
+                cmd, stdout=ffmpeg_log, stderr=ffmpeg_log, preexec_fn=os.setsid)
+            return process, None, output_pattern
+
+        output_file = f"{base_filename_no_ext}.{RECORD_CONTAINER_FORMAT}" if restart_idx == 0 else \
+            f"{base_filename_no_ext}-cont-{restart_idx:02d}.{RECORD_CONTAINER_FORMAT}"
+        cmd.append(output_file)
+        process = subprocess.Popen(
+            cmd, stdout=ffmpeg_log, stderr=ffmpeg_log, preexec_fn=os.setsid)
+        return process, output_file, None
+
+    ffmpeg, recording_file, segment_pattern = start_recording_process(0)
+    if recording_file is not None:
+        recording_files.append(recording_file)
+    if segment_pattern is not None:
+        segment_patterns.append(segment_pattern)
 
     # Check if ffmpeg died immediately or has initial errors
     time.sleep(2)
@@ -1096,14 +1132,41 @@ def join(meet_id, meet_pw, duration, description):
     print("*"*40 + "\n")
     logging.info("Recording started! Scheduled to end at: %s" % end_date.strftime('%H:%M:%S'))
     
+    ffmpeg_restart_attempts = 0
     meeting_running = True
     while meeting_running:
         if ffmpeg.poll() is not None:
             logging.error("FFmpeg exited unexpectedly with return code %s.", ffmpeg.returncode)
-            send_telegram_message("Recording for meeting '{}' stopped unexpectedly (ffmpeg exit code {}).".format(
-                description, ffmpeg.returncode))
-            ONGOING_MEETING = False
-            break
+            ffmpeg_restart_attempts += 1
+            if ffmpeg_restart_attempts > MAX_FFMPEG_RESTARTS:
+                send_telegram_message(
+                    "Recording for meeting '{}' stopped unexpectedly after {} ffmpeg restarts.".format(
+                        description, MAX_FFMPEG_RESTARTS))
+                ONGOING_MEETING = False
+                break
+
+            if not wait_for_display_ready(disp, retries=5, delay=2):
+                logging.error("Display %s unavailable while trying to restart ffmpeg.", disp)
+                time.sleep(2)
+                continue
+
+            ffmpeg, recording_file, segment_pattern = start_recording_process(ffmpeg_restart_attempts)
+            time.sleep(2)
+            if ffmpeg.poll() is not None:
+                logging.error("FFmpeg restart attempt %s failed.", ffmpeg_restart_attempts)
+                continue
+
+            if recording_file is not None:
+                recording_files.append(recording_file)
+            if segment_pattern is not None:
+                segment_patterns.append(segment_pattern)
+
+            logging.warning("FFmpeg restarted successfully (attempt %s/%s).",
+                            ffmpeg_restart_attempts, MAX_FFMPEG_RESTARTS)
+            send_telegram_message(
+                "Recording capture restarted for meeting '{}' (attempt {}/{}).".format(
+                    description, ffmpeg_restart_attempts, MAX_FFMPEG_RESTARTS))
+            continue
 
         time_now = datetime.now()
         time_remaining = end_date - time_now
@@ -1153,8 +1216,10 @@ def join(meet_id, meet_pw, duration, description):
         ffmpeg_log.close()
     unregister_killpg_handler()
 
-    if REMUX_TO_MP4 and not ENABLE_SEGMENTED_RECORDING and recording_file is not None and os.path.exists(recording_file):
-        remux_to_mp4(recording_file)
+    if REMUX_TO_MP4 and not ENABLE_SEGMENTED_RECORDING:
+        for recording_file in recording_files:
+            if recording_file is not None and os.path.exists(recording_file):
+                remux_to_mp4(recording_file)
 
     if not ONGOING_MEETING:
         try:
@@ -1294,6 +1359,9 @@ def find_due_meeting(now, meetings):
 
 def run_scheduler_loop():
     while True:
+        if should_reload_now():
+            logging.info("Reload request acknowledged.")
+
         now = datetime.now()
         meetings = parse_meetings()
         due_meeting = find_due_meeting(now, meetings)
@@ -1311,7 +1379,13 @@ def run_scheduler_loop():
             print("No upcoming meetings found.", end="\r", flush=True)
         else:
             print(f"Next meeting in {next_start - now}", end="\r", flush=True)
-        time.sleep(SCHEDULER_POLL_INTERVAL_SECONDS)
+        slept = 0
+        while slept < SCHEDULER_POLL_INTERVAL_SECONDS:
+            if should_reload_now():
+                logging.info("Reloading meetings.csv immediately.")
+                break
+            time.sleep(1)
+            slept += 1
 
 
 def main():
@@ -1321,6 +1395,11 @@ def main():
     except Exception:
         logging.error("Failed to create screenshot folder!")
         raise
+
+    try:
+        signal.signal(signal.SIGHUP, request_reload)
+    except Exception:
+        pass
 
     logging.info("Starting date-aware scheduler (poll interval: %ss).", SCHEDULER_POLL_INTERVAL_SECONDS)
     run_scheduler_loop()

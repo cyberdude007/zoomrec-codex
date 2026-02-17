@@ -196,6 +196,7 @@ Use these environment variables to tune quality, size, and compatibility for lon
 - `VIDEO_FPS` (default: `15`)
 - `AUDIO_CODEC` (default: `aac`, alternatives: `libmp3lame`, `opus`)
 - `AUDIO_BITRATE` (default: `128k`)
+- `MAX_FFMPEG_RESTARTS` (default: `5`) auto-restart attempts if capture process exits unexpectedly
 
 Example for long sessions with MP4 output compatibility:
 
@@ -218,6 +219,24 @@ kastldratza/zoomrec:latest
 ```
 
 FFmpeg errors are written to `/home/zoomrec/recordings/ffmpeg.log`.
+
+If display capture breaks temporarily (for example while interacting over VNC), zoomrec now attempts
+to restart ffmpeg automatically and continue recording in continuation files (`-cont-XX`).
+
+### Reload meetings.csv without restarting container
+
+zoomrec already re-reads `meetings.csv` periodically while running.  
+For immediate reload after editing:
+
+1. Trigger file method (recommended):
+```bash
+docker exec <container_name> touch /home/zoomrec/.meetings.reload
+```
+
+2. Signal method:
+```bash
+docker exec <container_name> pkill -HUP -f "python3 -u /home/zoomrec/zoomrec.py"
+```
 
 ### Windows / _cmd_
 
